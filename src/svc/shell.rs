@@ -1,7 +1,9 @@
 use std::time::Duration;
 use std::thread;
 use std::io::{Read, Write};
+use std::sync::Arc;
 use crate::proto::MAXDATA;
+use crate::svc::Service;
 use crossbeam_channel::{Sender, Receiver};
 use portable_pty::{native_pty_system, PtySize, CommandBuilder};
 use anyhow::Result;
@@ -30,9 +32,11 @@ fn cp_chan_to_stream(from: Receiver<Vec<u8>>, mut to: impl Write) {
     }
 }
 
-pub fn start(cmd_args: String) -> Result<(Sender<Vec<u8>>, Receiver<Vec<u8>>)> {
+pub fn start(cmd_args: String) -> Result<Service> {
     let (ret_tx, input) = crossbeam_channel::unbounded();
     let (output, ret_rx) = crossbeam_channel::unbounded();
+    let arc = Arc::new(());
+    let ptr = Arc::downgrade(&arc);
 
     thread::spawn(move || {
         let pair = native_pty_system().openpty(PtySize {
@@ -54,6 +58,7 @@ pub fn start(cmd_args: String) -> Result<(Sender<Vec<u8>>, Receiver<Vec<u8>>)> {
             let status = child.try_wait().unwrap();
             if status.is_some() {
                 child.wait().unwrap();
+                drop(arc);
                 break;
             } else {
                 thread::sleep(Duration::from_millis(100));
@@ -61,5 +66,9 @@ pub fn start(cmd_args: String) -> Result<(Sender<Vec<u8>>, Receiver<Vec<u8>>)> {
         }
     });
 
-    Ok((ret_tx, ret_rx))
+    Ok(Service {
+        tx: ret_tx,
+        rx: ret_rx,
+        ptr,
+    })
 }

@@ -1,6 +1,7 @@
 use std::io::Write;
+use std::sync::Weak;
 use std::env;
-use crossbeam_channel::{TryRecvError, Sender, Receiver};
+use crossbeam_channel::{Sender, Receiver};
 use std::collections::VecDeque;
 
 use anyhow::Result;
@@ -8,35 +9,39 @@ use crate::proto::{Message, CommandType};
 
 pub mod shell;
 
+pub struct Service {
+    tx: Sender<Vec<u8>>,
+    rx: Receiver<Vec<u8>>,
+    ptr: Weak<()>,
+}
+
 pub struct Stream {
     id: u32,
     remote_id: u32,
-    tx: Sender<Vec<u8>>,
-    rx: Receiver<Vec<u8>>,
+    svc: Service,
     pending_msgs: VecDeque<Message>,
     sent_ready: bool,
     ok_to_write: bool,
 }
 
 impl Stream {
-    pub fn new(id: u32, remote_id: u32, (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>)) -> Self {
+    pub fn new(id: u32, remote_id: u32, svc: Service) -> Self {
         Self {
             id,
             remote_id,
-            tx,
-            rx,
+            svc,
             pending_msgs: VecDeque::new(),
             sent_ready: false,
             ok_to_write: true,
         }
     }
-    pub fn tick(&mut self, mut out: &mut impl Write) -> Result<()> {
+    pub fn tick(&mut self, mut out: &mut impl Write) -> Result<bool> {
         if !self.sent_ready {
             Message::ready(self.id, self.remote_id).send_to(&mut out)?;
             self.sent_ready = true;
         }
 
-        for vec in self.rx.try_iter() {
+        for vec in self.svc.rx.try_iter() {
             let msg = Message::write(self.id, self.remote_id, vec);
             self.pending_msgs.push_back(msg);
         }
@@ -44,16 +49,18 @@ impl Stream {
         if self.ok_to_write {
             if let Some(msg) = self.pending_msgs.pop_front() {
                 msg.send_to(out)?;
+                self.ok_to_write = false;
 
-                if let Err(e) = self.rx.try_recv() {
-                    if self.pending_msgs.is_empty() && e == TryRecvError::Disconnected {
+                if self.svc.ptr.strong_count() == 0 {
+                    if self.pending_msgs.is_empty()  {
                         Message::close(self.id, self.remote_id).send_to(&mut out)?;
+                        return Ok(true);
                     }
                 }
             }
         }
 
-        Ok(())
+        Ok(false)
     }
     pub fn handle_msg(&mut self, msg: Message) -> Result<()> {
         match msg.meta().cmd() {
@@ -64,7 +71,7 @@ impl Stream {
             },
             CommandType::Write{..} => {
                 let data = msg.data().to_vec();
-                self.tx.send(data)?;
+                self.svc.tx.send(data)?;
             }
             _ => (),
         }
@@ -83,7 +90,7 @@ pub fn spawn(id: u32, remote_id: u32, which: String) -> Result<Stream> {
     let name = vec.get(0).unwrap();
     let arg = vec.get(1).unwrap();
 
-    let (tx, rx) = match *name {
+    let ret = match *name {
         "shell" => if arg == &"" {
             shell::start(env::var("SHELL").unwrap_or("sh".to_string()))?
         } else {
@@ -93,5 +100,5 @@ pub fn spawn(id: u32, remote_id: u32, which: String) -> Result<Stream> {
         other => unimplemented!("{other}"),
     };
 
-    Ok(Stream::new(id, remote_id, (tx, rx)))
+    Ok(Stream::new(id, remote_id, ret))
 }

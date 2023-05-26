@@ -95,10 +95,16 @@ fn main() -> Result<()> {
                             streams.insert(next_id, stream);
                             next_id += 1;
                         }
-                        CommandType::Ready{remote_id, ..} | CommandType::Write{remote_id, ..} => {
+                        CommandType::Ready{remote_id, ..} => {
                             let stream = streams.get_mut(&remote_id).unwrap();
-                            stream.handle_msg(msg)
-                                .expect("Failed to handle a message");
+                            stream.handle_msg(msg).expect("Failed to handle a message");
+                        }
+                        CommandType::Write{remote_id, local_id} => {
+                            Message::ready(*remote_id, *local_id).send_to(&mut ep_in)
+                                .expect("Failed to send message");
+
+                            let stream = streams.get_mut(&remote_id).unwrap();
+                            stream.handle_msg(msg).expect("Failed to handle a message");
                         }
                         CommandType::Close{remote_id, ..} => {
                             streams.remove(&remote_id).unwrap();
@@ -115,8 +121,11 @@ fn main() -> Result<()> {
                 },
                 default(Duration::from_millis(100)) => {
                     for (_, stream) in streams.iter_mut() {
-                        stream.tick(&mut ep_in)
+                        let kill_it = stream.tick(&mut ep_in)
                             .expect("Failed to tick a stream");
+                        if kill_it {
+                                println!("todo: killing streams");
+                        }
                     }
                 },
             );
