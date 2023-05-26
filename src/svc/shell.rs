@@ -14,8 +14,6 @@ fn cp_stream_to_chan(mut from: impl Read, to: Sender<Vec<u8>>) {
         let Ok(n) = from.read(&mut buf) else { return; };
         if n == 0 { return; }
         buf.resize(n, 0);
-
-        println!("shell out: {:?}", String::from_utf8_lossy(&buf));
     
         if to.send(buf).is_err() {
             break;
@@ -25,7 +23,6 @@ fn cp_stream_to_chan(mut from: impl Read, to: Sender<Vec<u8>>) {
 
 fn cp_chan_to_stream(from: Receiver<Vec<u8>>, mut to: impl Write) {
     for vec in from.iter() {
-        println!("shell in: {:?}", String::from_utf8_lossy(&vec));
         if to.write_all(&vec).is_err() {
             break;
         }
