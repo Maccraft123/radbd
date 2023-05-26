@@ -1,9 +1,9 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use std::thread;
-use std::sync::mpsc::{self, Sender, Receiver};
 use std::io::{Read, Write};
 use crate::proto::MAXDATA;
+use crossbeam_channel::{Sender, Receiver};
 use anyhow::Result;
 
 fn cp_stream_to_chan(mut from: impl Read, to: Sender<Vec<u8>>) {
@@ -31,8 +31,8 @@ fn cp_chan_to_stream(from: Receiver<Vec<u8>>, mut to: impl Write) {
 }
 
 pub fn single_shot(cmd_args: String) -> Result<(Sender<Vec<u8>>, Receiver<Vec<u8>>)> {
-    let (ret_tx, input) = mpsc::channel();
-    let (output, ret_rx) = mpsc::channel();
+    let (ret_tx, input) = crossbeam_channel::unbounded();
+    let (output, ret_rx) = crossbeam_channel::unbounded();
 
     thread::spawn(move || {
         let mut child = Command::new("bash")

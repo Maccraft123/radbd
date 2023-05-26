@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::sync::mpsc::{TryRecvError, Sender, Receiver};
+use crossbeam_channel::{TryRecvError, Sender, Receiver};
 use std::collections::VecDeque;
 
 use anyhow::Result;
