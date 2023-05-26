@@ -1,103 +1,52 @@
-use std::io::{Read, Cursor};
+use std::io::{self, Read, Cursor};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::mem;
 use anyhow::{bail, Context, Result};
-use std::thread;
-use std::sync::mpsc;
-use std::collections::VecDeque;
 
-pub struct MessageWatch {
-    pending: VecDeque<u8>,
-    rx: mpsc::Receiver<Vec<u8>>,
-    next_msg: Option<MetaMessage>,
-    next_data: Option<Vec<u8>>,
-}
+pub fn next_msg(from: &mut impl Read) -> Result<Message> {
+    let meta;
+    let mut read = 0;
+    let mut buf = [0; MAXDATA as usize];
 
-impl MessageWatch {
-    pub fn new(input: impl Read + Send + 'static) -> Self {
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || read_msgs(input, tx));
-        Self {
-            pending: VecDeque::new(),
-            rx,
-            next_msg: None,
-            next_data: None,
-        }
+    while read < mem::size_of::<MetaMessage>() {
+        read += from.read(&mut buf).expect("Failed to read message");
     }
-    pub fn has_msg(&mut self) -> Result<bool> {
-        self.update()?;
+    let mut vec = buf.to_vec();
+    vec.resize(mem::size_of::<MetaMessage>(), 0);
+    let mut cursor = Cursor::new(vec);
 
-        Ok(self.next_msg.is_some() && self.next_data.is_some())
-    }
-    pub fn next(&mut self) -> Result<Message> {
-        self.update()?;
+    let cmd = CommandType::try_from((
+            cursor.read_u32::<LittleEndian>()?,
+            cursor.read_u32::<LittleEndian>()?,
+            cursor.read_u32::<LittleEndian>()?))
+        .context("Failed to get command type")?;
+    meta = MetaMessage {
+        cmd,
+        len: cursor.read_u32::<LittleEndian>()?,
+        crc: cursor.read_u32::<LittleEndian>()?,
+        magic: cursor.read_u32::<LittleEndian>()?,
+    };
 
-        let Some(meta) = self.next_msg.take() else {
-            bail!("No message cached");
-        };
+    let mut data;
 
-        let Some(data) = self.next_data.take() else {
-            bail!("No data cached");
-        };
-
-        Ok(Message {
-            meta,
-            data,
-        })
-    }
-    fn update(&mut self) -> Result<()> {
-        for msg in self.rx.try_iter() {
-            println!("{:x?}", msg);
-            self.pending.append(&mut msg.into());
-        }
-
-        if self.next_msg.is_none() && 
-                self.pending.len() >= mem::size_of::<MetaMessage>() {
-            let msg: MetaMessage;
-            let vec = self.pending.drain(0..24)
-                .collect::<Vec<u8>>();
-            assert_eq!(vec.len(), mem::size_of::<MetaMessage>());
-            let mut cursor = Cursor::new(vec);
-            
-            let cmd = CommandType::try_from((
-                    cursor.read_u32::<LittleEndian>()?,
-                    cursor.read_u32::<LittleEndian>()?,
-                    cursor.read_u32::<LittleEndian>()?))
-                .context("Failed to get command type")?;
-            msg = MetaMessage {
-                cmd,
-                len: cursor.read_u32::<LittleEndian>()?,
-                crc: cursor.read_u32::<LittleEndian>()?,
-                magic: cursor.read_u32::<LittleEndian>()?,
-            };
-            self.next_msg = Some(msg);
-        }
-
-        if let Some(msg) = &self.next_msg {
-            if self.pending.len() >= msg.len as usize {
-                let vec = self.pending.drain(..msg.len as usize)
-                    .collect::<Vec<u8>>();
-                self.next_data = Some(vec);
-            } 
-        }
-        Ok(())
-    }
-}
-
-fn read_msgs(mut from: impl Read, tx: mpsc::Sender<Vec<u8>>) {
-    loop {
+    if meta.len > 0 {
         let mut buf = [0; MAXDATA as usize];
-        let n = from.read(&mut buf)
-            .expect("Failed to read message");
-        if n == 0 {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+        read = cursor.read(&mut buf).unwrap();
+        while read < meta.len as usize {
+            read += from.read(&mut buf).expect("Failed to read data");
         }
-        let mut vec = buf.to_vec();
-        vec.resize(n, 0);
-        if tx.send(vec).is_err() {
-            break;
-        }
+        assert_eq!(meta.len as usize, read);
+
+        data = buf.to_vec();
+        data.resize(meta.len as usize, 0);
+    } else {
+        data = Vec::new();
     }
+
+    Ok(Message {
+        meta,
+        data,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +62,7 @@ static_assertions::assert_eq_size!(MetaMessage, [u8; 24]);
 static_assertions::assert_eq_size!(CommandType, [u32; 3]);
 
 impl MetaMessage {
+    pub fn cmd(&self) -> &CommandType { &self.cmd }
     pub fn bytes(&self) -> &[u8; 24] {
         unsafe {mem::transmute(self)}
     }
@@ -145,8 +95,41 @@ impl Message {
             data,
         }
     }
+    pub fn ready(local_id: u32, remote_id: u32) -> Self {
+        let cmd = CommandType::Ready{local_id, remote_id};
+        Self::mk_msg(cmd, Vec::new())
+    }
+    pub fn write(local_id: u32, remote_id: u32, data: Vec<u8>) -> Self {
+        let cmd = CommandType::Write{local_id, remote_id};
+        Self::mk_msg(cmd, data)
+    }
+    pub fn close(local_id: u32, remote_id: u32) -> Self {
+        let cmd = CommandType::Close{local_id, remote_id};
+        Self::mk_msg(cmd, Vec::new())
+    }
+    fn mk_msg(cmd: CommandType, data: Vec<u8>) -> Self {
+        let magic = cmd.magic();
+        Self {
+            meta: MetaMessage {
+                cmd,
+                crc: 0,
+                len: data.len() as u32,
+                magic,
+            },
+            data,
+        }
+    }
     pub fn to_bytes(self) -> (Vec<u8>, Vec<u8>) {
         (self.meta.bytes().to_vec(), self.data)
+    }
+    pub fn send_to(self, to_where: &mut impl io::Write) -> Result<()> {
+        println!("tx: {:#x?}", self.meta());
+        let (header, data) = self.to_bytes();
+        to_where.write_all(&header)
+            .context("Failed to write header")?;
+        to_where.write_all(&data)
+            .context("Failed to write payload")?;
+        Ok(())
     }
 }
 
@@ -191,7 +174,7 @@ impl CommandType {
             Close{..} => A_CLSE_MAGIC,
         }
     }
-    fn name(&self) -> &'static str{
+    /*fn name(&self) -> &'static str{
         use CommandType::*;
         match self {
             Connect{..} => "Connect",
@@ -202,7 +185,7 @@ impl CommandType {
             Write{..} => "Write",
             Close{..} => "Close",
         }
-    }
+    }*/
 }
 
 impl TryFrom<(u32, u32, u32)> for CommandType {
