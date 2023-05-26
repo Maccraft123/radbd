@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::env;
 use crossbeam_channel::{TryRecvError, Sender, Receiver};
 use std::collections::VecDeque;
 
@@ -84,9 +85,9 @@ pub fn spawn(id: u32, remote_id: u32, which: String) -> Result<Stream> {
 
     let (tx, rx) = match *name {
         "shell" => if arg == &"" {
-            shell::single_shot("bash".to_string())?
+            shell::start(env::var("SHELL").unwrap_or("sh".to_string()))?
         } else {
-            shell::single_shot(arg.to_string())?
+            shell::start(arg.to_string())?
         },
 
         other => unimplemented!("{other}"),

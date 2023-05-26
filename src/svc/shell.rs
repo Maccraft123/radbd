@@ -1,9 +1,9 @@
-use std::process::{Command, Stdio};
 use std::time::Duration;
 use std::thread;
 use std::io::{Read, Write};
 use crate::proto::MAXDATA;
 use crossbeam_channel::{Sender, Receiver};
+use portable_pty::{native_pty_system, PtySize, CommandBuilder};
 use anyhow::Result;
 
 fn cp_stream_to_chan(mut from: impl Read, to: Sender<Vec<u8>>) {
@@ -30,27 +30,25 @@ fn cp_chan_to_stream(from: Receiver<Vec<u8>>, mut to: impl Write) {
     }
 }
 
-pub fn single_shot(cmd_args: String) -> Result<(Sender<Vec<u8>>, Receiver<Vec<u8>>)> {
+pub fn start(cmd_args: String) -> Result<(Sender<Vec<u8>>, Receiver<Vec<u8>>)> {
     let (ret_tx, input) = crossbeam_channel::unbounded();
     let (output, ret_rx) = crossbeam_channel::unbounded();
 
     thread::spawn(move || {
-        let mut child = Command::new("bash")
-            .arg("-c")
-            .arg(cmd_args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("Failed to spawn bash");
-        let output_2 = output.clone();
-    
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        thread::spawn(move || cp_chan_to_stream(input, stdin));
-        thread::spawn(move || cp_stream_to_chan(stdout, output));
-        thread::spawn(move || cp_stream_to_chan(stderr, output_2));
+        let pair = native_pty_system().openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0
+        }).unwrap();
+        let cmd = CommandBuilder::new(cmd_args);
+        let mut child = pair.slave.spawn_command(cmd).unwrap();
+
+        let reader = pair.master.try_clone_reader().unwrap();
+        let writer = pair.master.take_writer().unwrap();
+
+        thread::spawn(move || cp_chan_to_stream(input, writer));
+        thread::spawn(move || cp_stream_to_chan(reader, output));
 
         loop {
             let status = child.try_wait().unwrap();
