@@ -8,6 +8,7 @@ use anyhow::Result;
 use crate::proto::{Message, CommandType};
 
 pub mod shell;
+pub mod sync;
 
 pub struct Service {
     tx: Sender<Vec<u8>>,
@@ -50,13 +51,14 @@ impl Stream {
             if let Some(msg) = self.pending_msgs.pop_front() {
                 msg.send_to(out)?;
                 self.ok_to_write = false;
+            }
+        }
 
-                if self.svc.ptr.strong_count() == 0 {
-                    if self.pending_msgs.is_empty()  {
-                        Message::close(self.id, self.remote_id).send_to(&mut out)?;
-                        return Ok(true);
-                    }
-                }
+        if self.svc.ptr.strong_count() == 0 {
+            if self.pending_msgs.is_empty()  {
+                println!("Closing stream {}", self.id);
+                Message::close(self.id, self.remote_id).send_to(&mut out)?;
+                return Ok(true);
             }
         }
 
@@ -96,8 +98,8 @@ pub fn spawn(id: u32, remote_id: u32, which: String) -> Result<Stream> {
         } else {
             shell::start(arg.to_string())?
         },
-
-        other => unimplemented!("{other}"),
+        "sync" => sync::start()?,
+        _ => todo!("{:?}", which),
     };
 
     Ok(Stream::new(id, remote_id, ret))
