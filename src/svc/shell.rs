@@ -42,7 +42,10 @@ pub fn start(cmd_args: String) -> Result<Service> {
             pixel_width: 0,
             pixel_height: 0
         }).unwrap();
-        let cmd = CommandBuilder::new(cmd_args);
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.arg("-c");
+        cmd.arg(cmd_args);
+
         let mut child = pair.slave.spawn_command(cmd).unwrap();
 
         let reader = pair.master.try_clone_reader().unwrap();
