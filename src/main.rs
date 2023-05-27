@@ -124,7 +124,7 @@ fn main() -> Result<()> {
                         let kill_it = stream.tick(&mut ep_in)
                             .expect("Failed to tick a stream");
                         if kill_it {
-                                println!("todo: killing streams");
+                            println!("todo: killing streams");
                         }
                     }
                 },
