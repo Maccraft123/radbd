@@ -1,7 +1,6 @@
 use std::io::Write;
-use std::sync::Weak;
 use std::env;
-use crossbeam_channel::{Sender, Receiver};
+use crossbeam_channel::Receiver;
 use std::collections::VecDeque;
 
 use anyhow::Result;
@@ -9,24 +8,28 @@ use crate::proto::{Message, CommandType};
 
 pub mod shell;
 pub mod sync;
+use shell::ShellService;
+use sync::SyncService;
 
-pub struct Service {
-    tx: Sender<Vec<u8>>,
-    rx: Receiver<Vec<u8>>,
-    ptr: Weak<()>,
+pub trait Service {
+    fn handle_write(&mut self, data: Vec<u8>) -> Result<()>;
+    fn recv(&mut self) -> &mut Receiver<Vec<u8>>;
+    fn is_done(&mut self) -> bool;
+    fn close(&mut self) -> Result<()> { Ok(()) }
 }
 
 pub struct Stream {
     id: u32,
     remote_id: u32,
-    svc: Service,
+    svc: Box<dyn Service>,
     pending_msgs: VecDeque<Message>,
     sent_ready: bool,
     ok_to_write: bool,
+    die: bool,
 }
 
 impl Stream {
-    pub fn new(id: u32, remote_id: u32, svc: Service) -> Self {
+    pub fn new(id: u32, remote_id: u32, svc: Box<dyn Service>) -> Self {
         Self {
             id,
             remote_id,
@@ -34,6 +37,7 @@ impl Stream {
             pending_msgs: VecDeque::new(),
             sent_ready: false,
             ok_to_write: true,
+            die: false,
         }
     }
     pub fn tick(&mut self, mut out: &mut impl Write) -> Result<bool> {
@@ -42,7 +46,7 @@ impl Stream {
             self.sent_ready = true;
         }
 
-        for vec in self.svc.rx.try_iter() {
+        for vec in self.svc.recv().try_iter() {
             let msg = Message::write(self.id, self.remote_id, vec);
             self.pending_msgs.push_back(msg);
         }
@@ -54,9 +58,10 @@ impl Stream {
             }
         }
 
-        if self.svc.ptr.strong_count() == 0 {
+        if self.svc.is_done() || self.die {
             if self.pending_msgs.is_empty()  {
                 println!("Closing stream {}", self.id);
+                self.svc.close()?;
                 Message::close(self.id, self.remote_id).send_to(&mut out)?;
                 return Ok(true);
             }
@@ -73,16 +78,16 @@ impl Stream {
             },
             CommandType::Write{..} => {
                 let data = msg.data().to_vec();
-                self.svc.tx.send(data)?;
+                self.svc.handle_write(data)?;
+                self.sent_ready = false;
             }
             _ => (),
         }
         Ok(())
     }
-    #[allow(dead_code)]
-    pub fn id(&self) -> u32 { self.id }
-    #[allow(dead_code)]
-    pub fn remote_id(&self) -> u32 { self.remote_id }
+    pub fn schedule_death(&mut self) {
+        self.die = true;
+    }
 }
 
 pub fn spawn(id: u32, remote_id: u32, which: String) -> Result<Stream> {
@@ -94,11 +99,11 @@ pub fn spawn(id: u32, remote_id: u32, which: String) -> Result<Stream> {
 
     let ret = match *name {
         "shell" => if arg == &"" {
-            shell::start(env::var("SHELL").unwrap_or("sh".to_string()))?
+            ShellService::start(env::var("SHELL").unwrap_or("sh".to_string()))?
         } else {
-            shell::start(arg.to_string())?
+            ShellService::start(arg.to_string())?
         },
-        "sync" => sync::start()?,
+        "sync" => SyncService::start()?,
         _ => todo!("{:?}", which),
     };
 

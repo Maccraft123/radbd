@@ -1,10 +1,7 @@
 use crate::svc::Service;
-use std::sync::Arc;
-use std::thread;
 use std::path::PathBuf;
-use std::mem;
 use nix::sys::stat::{stat, mode_t, Mode};
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Sender, Receiver};
 use anyhow::{bail, Result};
 
 #[derive(Debug, Clone)]
@@ -46,21 +43,17 @@ enum State {
     SendMoreData,
 }
 
+pub 
 struct SyncService {
     state: State,
+    rx: Receiver<Vec<u8>>,
+    tx: Sender<Vec<u8>>,
+    done: bool,
 }
 
-impl SyncService {
-    fn new() -> Self {
-        Self { state: State::Normal }
-    }
-    fn get_next_cmd(&mut self, from: &Receiver<Vec<u8>>) -> Result<(Request, PathBuf)> {
-        let packet = from.recv()?;
-        if packet.len() < 8 {
-            bail!("Invalid sync packet length");
-        }
-
-        match &packet[0..4] {
+impl Service for SyncService {
+    fn handle_write(&mut self, packet: Vec<u8>) -> Result<()> {
+        let (cmd, path) = match &packet[0..4] {
             //b"LIST" => Request::List,
             //b"RECV" => Request::Recv,
             b"SEND" => {
@@ -99,8 +92,8 @@ impl SyncService {
                     if packet[offset..][..4] != *b"DONE" {
                         bail!("Expected {:x?}(DONE), found {:x?}", b"DONE", &packet[offset..][..4])
                     }
-                    offset += 4;
-                    // Note: now at [offset..][..4] there is a u32 for creation time. we don't care.
+                    
+                    // Note: at offset+4 there is a u32 for creation time. we don't care.
 
                     self.state = State::Normal;
                     append = false;
@@ -111,7 +104,7 @@ impl SyncService {
 
                 println!("{:?} {:x?}", path, mode);
 
-                Ok((Request::Send{mode, data, append}, PathBuf::from(path)))
+                (Request::Send{mode, data, append}, PathBuf::from(path))
             },
             b"STAT" => {
                 let len = u32::from_le_bytes([packet[4], packet[5], packet[6], packet[7]]);
@@ -120,63 +113,58 @@ impl SyncService {
                 if path.len() != len as usize {
                     bail!("Length of path({:x}) isn't equal to length expected({:x})", path.len(), len)
                 }
-                Ok((Request::Stat, PathBuf::from(path)))
+                (Request::Stat, PathBuf::from(path))
             },
             b"QUIT" => {
-                Ok((Request::Quit, PathBuf::from("/dev/null")))
+                (Request::Quit, PathBuf::from("/dev/null"))
             }
             unknown => {
                 bail!("Unknown sync cmd {:x?}", String::from_utf8_lossy(unknown));
             },
-        }
+        };
+
+        let response = match cmd {
+            Request::Stat => {
+                let stat = stat(&path).unwrap();
+                Response::Stat{
+                    size: stat.st_size as u32,
+                    mode: stat.st_mode,
+                    mtime: stat.st_mtime as u32,
+                }
+            },
+            Request::Send{..} => {
+                eprintln!("Writing into {:?} goes here", path);
+
+                Response::Okay
+            }
+            Request::Quit => {
+                self.done = true;
+                Response::Okay
+            }
+            _ => todo!(),
+        };
+
+        self.tx.send(response.to_bytes())?;
+
+        Ok(())
+    }
+    fn recv(&mut self) -> &mut Receiver<Vec<u8>> {
+        &mut self.rx
+    }
+    fn is_done(&mut self) -> bool {
+        self.done
     }
 }
 
-pub fn start() -> Result<Service> {
-    let (ret_tx, input) = crossbeam_channel::unbounded::<Vec<u8>>();
-    let (output, ret_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+impl SyncService {
+    pub fn start() -> Result<Box<dyn Service>> {
+        let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
-    let arc = Arc::new(());
-    let ptr = Arc::downgrade(&arc);
-
-    thread::spawn(move || {
-        let mut svc = SyncService::new();
-        loop {
-            let (cmd, path) = svc.get_next_cmd(&input).unwrap();
-            println!("{:?}", cmd);
-
-            let response = match cmd {
-                Request::Stat => {
-                    let stat = stat(&path).unwrap();
-                    Response::Stat{
-                        size: stat.st_size as u32,
-                        mode: stat.st_mode,
-                        mtime: stat.st_mtime as u32,
-                    }
-                },
-                Request::Send{..} => {
-                    eprintln!("Writing into {:?} goes here", path);
-
-                    Response::Okay
-                }
-                Request::Quit => {
-                    break;
-                }
-                _ => todo!(),
-            };
-
-            output.send(response.to_bytes());
-        }
-        
-        let ptr = Arc::downgrade(&arc);
-        println!("Quitting sync, strong count {}", ptr.strong_count());
-        drop(arc);
-        println!("Now {}", ptr.strong_count());
-    });
-
-    Ok(Service {
-        tx: ret_tx,
-        rx: ret_rx,
-        ptr,
-    })
+        Ok(Box::new(Self {
+            tx,
+            rx,
+            done: false,
+            state: State::Normal,
+        }))
+    }
 }
